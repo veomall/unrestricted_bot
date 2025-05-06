@@ -1,0 +1,17 @@
+{
+    "text": {
+        "deepseek-r1": "PollinationsAI",
+        "deepseek-v3": "DeepInfraChat",
+        "gpt-4o": "PollinationsAI",
+        "o3-mini": "PollinationsAI",
+        "grok-3": "HarProvider",
+        "llama-4-scout": "Cloudflare",
+        "sonar-reasoning-pro": "PerplexityLabs",
+        "dolphin-2.9": "DeepInfraChat"
+    },
+    "image": {
+        "midjourney": "PollinationsAI",
+        "dall-e-3": "PollinationsAI",
+        "flux-pro": "PollinationsAI"
+    }
+}
