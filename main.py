@@ -2,7 +2,11 @@ import os
 import json
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import multiprocessing
+import concurrent.futures
+import time
+from functools import partial
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MenuButton, MenuButtonCommands
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import g4f
 from g4f.client import Client
@@ -18,7 +22,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # States for conversation
-CHOOSING_CATEGORY, CHOOSING_MODEL, CHATTING, CHOOSING_LANGUAGE, TRANSLATING = range(5)
+CHOOSING_CATEGORY, CHOOSING_MODEL, CHATTING, CHOOSING_LANGUAGE, TRANSLATING, SETTING_PROMPT = range(6)
+
+# Global variable to track active processes
+active_processes = {}
 
 # Load models from JSON file
 def load_models():
@@ -32,6 +39,38 @@ def load_models():
 # Global models dictionary
 MODELS = load_models()
 
+# Function to run in a separate process for text generation
+def generate_text(model_name, messages, provider_name):
+    try:
+        provider = getattr(g4f.Provider, provider_name, None)
+        if not provider:
+            return {"error": f"Provider {provider_name} not found"}
+        
+        response = g4f.ChatCompletion.create(
+            model=model_name,
+            messages=messages,
+            provider=provider,
+        )
+        return {"result": response}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Function to run in a separate process for image generation
+def generate_image(model_name, prompt):
+    try:
+        client = Client()
+        response = client.images.generate(
+            model=model_name,
+            prompt=prompt,
+            response_format="url"
+        )
+        if response and response.data and len(response.data) > 0:
+            return {"result": response.data[0].url}
+        else:
+            return {"error": "No image was generated"}
+    except Exception as e:
+        return {"error": str(e)}
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Send message on `/start`."""
     user = update.effective_user
@@ -39,7 +78,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     # Show available commands
     commands_text = (
-        f"Привет, {user.first_name}! Я робот-долбоёб.\n\n"
+        f"Привет, {user.first_name}! Я бот для доступа к ИИ-моделям.\n\n"
         "Доступные команды:\n"
         "/translate - Перевести текст\n"
         "/model - Выбрать модель AI\n"
@@ -86,10 +125,49 @@ async def select_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Clear message history when changing models
     context.user_data["messages"] = []
     
+    # Create keyboard for prompt choice
+    keyboard = [
+        [InlineKeyboardButton("Да, установить промпт", callback_data="prompt_yes")],
+        [InlineKeyboardButton("Нет, продолжить без промпта", callback_data="prompt_no")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await query.edit_message_text(
-        f"Выбрана модель {model_name}\n"
-        f"Теперь вы можете начать {'чат' if category == 'text' else 'генерировать изображения'}!\n"
-        "Отправь /model чтобы изменить модель или /reset чтобы очистить историю разговора."
+        f"Вы выбрали модель {model_name} с провайдером {provider_name}.\n"
+        f"Теперь вы можете начать {'общение' if category == 'text' else 'генерацию изображений'}!\n"
+        "Отправьте /model для смены модели или /reset для очистки истории разговора.\n\n"
+        "Хотите установить системный промпт для этой модели? (Это повлияет на все последующие ответы до сброса чата)",
+        reply_markup=reply_markup
+    )
+    return SETTING_PROMPT
+
+async def handle_prompt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user's choice about setting a system prompt."""
+    query = update.callback_query
+    await query.answer()
+    
+    choice = query.data.split('_')[1]
+    
+    if choice == 'yes':
+        await query.edit_message_text(
+            "Пожалуйста, отправьте системный промпт, который будет использоваться для этой модели."
+        )
+        return SETTING_PROMPT
+    else:  # choice == 'no'
+        context.user_data["system_prompt"] = None
+        await query.edit_message_text(
+            "Системный промпт не установлен. Вы можете начать общение с моделью."
+        )
+        return CHATTING
+
+async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set the system prompt for the current model."""
+    prompt = update.message.text
+    context.user_data["system_prompt"] = prompt
+    
+    await update.message.reply_text(
+        f"Системный промпт установлен:\n{prompt}\n\n"
+        "Вы можете начать общение с моделью. Промпт будет использоваться до сброса чата."
     )
     return CHATTING
 
@@ -118,9 +196,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     category = context.user_data.get("current_category", "text")
     model_name = context.user_data.get("current_model")
     provider_name = context.user_data.get("current_provider")
+    user_id = update.effective_user.id
     
     if not model_name or not provider_name:
-        await update.message.reply_text("Модель не выбрана, нажмите /start")
+        await update.message.reply_text("Пожалуйста, выберите модель с помощью /start")
         return CHATTING
     
     # Add the user message to history
@@ -129,63 +208,158 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     context.user_data["messages"].append({"role": "user", "content": user_message})
     
-    # Send "typing" action
-    await update.message.chat.send_action(action="typing")
+    # Create keyboard with cancel button
+    keyboard = [[InlineKeyboardButton("Отменить запрос", callback_data="cancel_request")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send "waiting" message with cancel button
+    waiting_message = await update.message.reply_text(
+        "Запрос отправлен, ожидаю ответа от модели...",
+        reply_markup=reply_markup
+    )
+    
+    # Store message ID for later reference
+    context.user_data["waiting_message_id"] = waiting_message.message_id
     
     try:
-        if category == "text":
-            # Handle text generation
-            # Get the provider class dynamically
-            provider = getattr(g4f.Provider, provider_name, None)
-            if not provider:
-                raise ValueError(f"Provider {provider_name} not found")
+        # Create a multiprocessing pool with 1 worker
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+            if category == "text":
+                # Prepare messages with system prompt if available
+                messages = context.user_data["messages"].copy()
+                system_prompt = context.user_data.get("system_prompt")
+                if system_prompt:
+                    messages.insert(0, {"role": "system", "content": system_prompt})
                 
-            # Generate AI response
-            response = await g4f.ChatCompletion.create_async(
-                model=model_name,
-                messages=context.user_data["messages"],
-                provider=provider,
-            )
-            
-            # Add AI response to history
-            context.user_data["messages"].append({"role": "assistant", "content": response})
-            
-            # Send response
-            await update.message.reply_text(response)
-        else:
-            # Translate the prompt to English for better image generation results
-            translated_prompt = await translate_text(user_message, "English")
-            
-            # Send feedback that translation occurred
-            if translated_prompt != user_message:
-                await update.message.reply_text(f"Запрос: {translated_prompt}")
-            
-            # Handle image generation using Client API
-            # Using asyncio.to_thread to run the synchronous method in a non-blocking way
-            client = Client()
-            
-            # Define a function to run synchronously
-            def generate_image():
-                return client.images.generate(
-                    model=model_name,
-                    prompt=translated_prompt,  # Use translated prompt
-                    response_format="url"
-                )
-            
-            # Run the synchronous function in a separate thread
-            response = await asyncio.to_thread(generate_image)
-            
-            # Send image
-            if response and response.data and len(response.data) > 0:
-                image_url = response.data[0].url
-                await update.message.reply_photo(image_url)
-            else:
-                await update.message.reply_text("Не удалось сгенерировать изображение. Пожалуйста, попробуйте снова.")
+                # Start the generation process
+                future = executor.submit(generate_text, model_name, messages, provider_name)
+                
+                # Store the future and executor in context for cancellation
+                process_key = f"{user_id}_{int(time.time())}"
+                active_processes[process_key] = {
+                    "future": future,
+                    "executor": executor,
+                    "start_time": time.time()
+                }
+                context.user_data["process_key"] = process_key
+                
+                try:
+                    # Wait for result or cancellation
+                    result = None
+                    while not future.done():
+                        # Check if canceled every 0.1 seconds
+                        await asyncio.sleep(0.1)
+                        if context.user_data.get("request_cancelled", False):
+                            # Force shutdown the executor to kill the process
+                            if process_key in active_processes:
+                                executor._processes.clear()
+                                executor.shutdown(wait=False)
+                                del active_processes[process_key]
+                            raise asyncio.CancelledError("Request was cancelled")
+                    
+                    # Get the result
+                    result = future.result()
+                    
+                    # Check for errors
+                    if "error" in result:
+                        raise Exception(result["error"])
+                    
+                    response = result["result"]
+                    
+                    # Add AI response to history
+                    context.user_data["messages"].append({"role": "assistant", "content": response})
+                    
+                    # Delete waiting message and send response
+                    await waiting_message.delete()
+                    await update.message.reply_text(response)
+                    
+                except concurrent.futures.TimeoutError:
+                    # Handle timeout
+                    await waiting_message.delete()
+                    await update.message.reply_text("Превышено время ожидания ответа. Пожалуйста, попробуйте еще раз.")
+                finally:
+                    # Clean up
+                    if process_key in active_processes:
+                        del active_processes[process_key]
+                    context.user_data["request_cancelled"] = False
+                
+            else:  # category == "image"
+                # Translate the prompt to English for better image generation results
+                translated_prompt = await translate_text(user_message, "English")
+                
+                # Send feedback that translation occurred
+                if translated_prompt != user_message:
+                    await update.message.reply_text(f"Переведенный запрос: {translated_prompt}")
+                
+                # Start the image generation process
+                future = executor.submit(generate_image, model_name, translated_prompt)
+                
+                # Store the future and executor in context for cancellation
+                process_key = f"{user_id}_{int(time.time())}"
+                active_processes[process_key] = {
+                    "future": future,
+                    "executor": executor,
+                    "start_time": time.time()
+                }
+                context.user_data["process_key"] = process_key
+                
+                try:
+                    # Wait for result or cancellation
+                    result = None
+                    while not future.done():
+                        # Check if canceled every 0.1 seconds
+                        await asyncio.sleep(0.1)
+                        if context.user_data.get("request_cancelled", False):
+                            # Force shutdown the executor to kill the process
+                            if process_key in active_processes:
+                                executor._processes.clear()
+                                executor.shutdown(wait=False)
+                                del active_processes[process_key]
+                            raise asyncio.CancelledError("Request was cancelled")
+                    
+                    # Get the result
+                    result = future.result()
+                    
+                    # Check for errors
+                    if "error" in result:
+                        raise Exception(result["error"])
+                    
+                    image_url = result["result"]
+                    
+                    # Delete waiting message
+                    await waiting_message.delete()
+                    
+                    # Send image
+                    await update.message.reply_photo(image_url)
+                    
+                except concurrent.futures.TimeoutError:
+                    # Handle timeout
+                    await waiting_message.delete()
+                    await update.message.reply_text("Превышено время ожидания ответа. Пожалуйста, попробуйте еще раз.")
+                finally:
+                    # Clean up
+                    if process_key in active_processes:
+                        del active_processes[process_key]
+                    context.user_data["request_cancelled"] = False
+    
+    except asyncio.CancelledError:
+        # Request was cancelled
+        logger.info(f"Request cancelled for user {user_id}")
+        # Remove the last user message from history
+        if context.user_data["messages"]:
+            context.user_data["messages"].pop()
     except Exception as e:
         logger.error(f"Error generating response: {e}")
+        # Delete waiting message
+        try:
+            await waiting_message.delete()
+        except:
+            pass
+        
+        # Send error message and retry prompt
         await update.message.reply_text(
-            f"Извините, я не смог сгенерировать ответ с {model_name}. "
-            "Пожалуйста, попробуйте снова или выберите другую модель с /model."
+            f"Произошла ошибка при обработке запроса: {str(e)}\n"
+            "Пожалуйста, попробуйте отправить запрос еще раз."
         )
     
     return CHATTING
@@ -213,7 +387,7 @@ async def change_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /help is issued."""
     await update.message.reply_text(
-        "Чё, уже забыл что я делаю? Я напомню:\n"
+        "Доступные команды:\n"
         "/translate - Перевести текст\n"
         "/model - Выбрать модель AI\n"
         "/reset - Очистить историю разговора\n"
@@ -259,6 +433,36 @@ async def process_translation(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     return CHATTING
 
+async def cancel_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the current request."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    
+    # Mark request as cancelled
+    context.user_data["request_cancelled"] = True
+    
+    # Try to cancel the process if it exists
+    process_key = context.user_data.get("process_key")
+    if process_key and process_key in active_processes:
+        process_info = active_processes[process_key]
+        # Force shutdown executor to kill the process
+        process_info["executor"]._processes.clear()
+        process_info["executor"].shutdown(wait=False)
+        del active_processes[process_key]
+    
+    # Delete the waiting message
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    await query.message.reply_text(
+        "Запрос отменен. Вы можете отправить новый запрос."
+    )
+    
+    return CHATTING
+
 def main() -> None:
     """Run the bot."""
     # Get token from environment variable
@@ -267,8 +471,24 @@ def main() -> None:
         logger.error("No TELEGRAM_TOKEN found in environment variables!")
         return
     
+    # Enable process forking (needed for ProcessPoolExecutor on Windows)
+    if os.name == 'nt':  # Windows
+        multiprocessing.set_start_method('spawn', force=True)
+    
     # Create the Application
     application = Application.builder().token(token).build()
+    
+    # Set up commands menu
+    commands = [
+        ("start", "Запустить бота"),
+        ("model", "Изменить модель AI"),
+        ("reset", "Очистить историю разговора"),
+        ("help", "Показать справку"),
+        ("translate", "Перевести текст")
+    ]
+    
+    # Set commands in menu
+    application.bot.set_my_commands(commands)
     
     # Set up conversation handler
     conv_handler = ConversationHandler(
@@ -281,6 +501,7 @@ def main() -> None:
                 CommandHandler("reset", reset_conversation),
                 CommandHandler("help", help_command),
                 CommandHandler("translate", translate_command),
+                CallbackQueryHandler(cancel_request, pattern=r"^cancel_request$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
             ],
             CHOOSING_LANGUAGE: [
@@ -290,6 +511,11 @@ def main() -> None:
             TRANSLATING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_translation),
                 CommandHandler("cancel", lambda u, c: (u.message.reply_text("Перевод отменен."), CHATTING)[-1]),
+            ],
+            SETTING_PROMPT: [
+                CallbackQueryHandler(handle_prompt_choice, pattern=r"^prompt_(yes|no)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_system_prompt),
+                CommandHandler("cancel", lambda u, c: (u.message.reply_text("Установка промпта отменена."), CHATTING)[-1]),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
